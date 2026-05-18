@@ -2,7 +2,17 @@ package metadata
 
 type (
 	Record struct {
-		Queries []*RecordQuery `json:"queries"`
+		ProjectID  int
+		ScanID     string
+		PathErrors []PathError
+		Queries    []*RecordQuery `json:"queries"`
+	}
+
+	PathError struct {
+		ProjectID int
+		ScanID    string
+		PathID    string
+		Reason    string
 	}
 
 	RecordQuery struct {
@@ -20,6 +30,7 @@ type (
 		SimilarityID     string `json:"similarityId"`
 		ResultID         string `json:"-"`
 		SASTSimilarityID string `json:"-"`
+		DetectionDate    string `json:"-"`
 	}
 
 	Query struct {
@@ -31,11 +42,12 @@ type (
 	}
 
 	Result struct {
-		PathID       string
-		ResultID     string
-		SimilarityID string
-		FirstNode    Node
-		LastNode     Node
+		PathID        string
+		ResultID      string
+		SimilarityID  string
+		DetectionDate string
+		FirstNode     Node
+		LastNode      Node
 	}
 
 	Node struct {
@@ -49,12 +61,14 @@ type (
 		ResultID, PathID,
 		Filename1, Name1, Line1, Column1, MethodLine1,
 		Filename2, Name2, Line2, Column2, MethodLine2,
-		QueryID string
-		SimIDVersion int
+		QueryID       string
+		SimIDVersion  int
+		DetectionDate string
 	}
 
 	SimilarityCalculationResult struct {
 		Err                            error
 		ResultID, PathID, SimilarityID string
+		DetectionDate                  string
 	}
 )

@@ -54,6 +54,7 @@ type Client interface {
 	GetSamlTeamMappings() ([]*SamlTeamMapping, error)
 	GetProjectsWithLastScanID(fromDate, teamName, projectsIDs string, offset, limit int) (*[]ProjectWithLastScanID, error)
 	GetTriagedResultsByScanID(scanID int) (*[]TriagedScanResult, error)
+	GetAllResultsByScanID(scanID int) (*[]TriagedScanResult, error)
 	CreateScanReport(scanID int, reportType string, retry Retry) ([]byte, error)
 	GetEngineServers() ([]*EngineServer, error)
 	GetEngineConfigurations(projectID int) ([]byte, error)
@@ -379,6 +380,35 @@ func (c *APIClient) GetTriagedResultsByScanID(scanID int) (*[]TriagedScanResult,
 	if unmarshalErr != nil {
 		return nil, unmarshalErr
 	}
+	return &response.Value, nil
+}
+
+// GetAllResultsByScanID fetches results for a scan without any OData filter (bypasses "Comment ne null").
+// It returns at least 1 result if the scan has any results at all.
+func (c *APIClient) GetAllResultsByScanID(scanID int) (*[]TriagedScanResult, error) {
+	log.Debug().Int("scanID", scanID).Msg("fetching all results for scan (bypassing OData comment filter)")
+	url := fmt.Sprintf("%s/Cxwebinterface/odata/v1/Scans(%d)/Results", c.BaseURL, scanID)
+	req, requestErr := CreateRequest(http.MethodGet, url, nil, c.Token)
+	if requestErr != nil {
+		log.Debug().Err(requestErr).Int("scanID", scanID).Msg("failed creating request for GetAllResultsByScanID")
+		return nil, requestErr
+	}
+	q := req.URL.Query()
+	q.Add("$top", "1")
+	q.Add("$select", "Id")
+	req.URL.RawQuery = q.Encode()
+	body, getErr := c.getResponseBodyFromRequest(req)
+	if getErr != nil {
+		log.Debug().Err(getErr).Int("scanID", scanID).Msg("failed fetching all results for scan")
+		return nil, getErr
+	}
+	var response ODataTriagedResultsByScan
+	unmarshalErr := json.Unmarshal(body, &response)
+	if unmarshalErr != nil {
+		log.Debug().Err(unmarshalErr).Int("scanID", scanID).Msg("failed unmarshaling GetAllResultsByScanID response")
+		return nil, unmarshalErr
+	}
+	log.Debug().Int("scanID", scanID).Int("count", len(response.Value)).Msg("fetched all results for scan")
 	return &response.Value, nil
 }
 

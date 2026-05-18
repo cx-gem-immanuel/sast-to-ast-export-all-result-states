@@ -31,6 +31,9 @@ const (
 	simIDVersionArg         = "simIDVersion"
 	excludeFileArg          = "exclude-file"
 	addCustomExtArg         = "addCustomExt"
+	allResultStatesArg          = "all-result-states"
+	simIDMappingFileArg         = "simid-mapping-file"
+	simIDMappingFileAppendArg   = "simid-mapping-file-append"
 
 	projectsActiveSinceDefaultValue = 180
 	emptyProjectsActiveSince        = 0
@@ -156,6 +159,19 @@ func init() {
 		"",
 		"",
 		"add custom extensions via CLI e.g. --addCustomExt 'Perl esp PERL_EXTENSIONS'.")
+	rootCmd.Flags().Bool(
+		allResultStatesArg,
+		false,
+		"include results from all result states (triaged and untriaged)")
+	rootCmd.Flags().StringP(
+		simIDMappingFileArg,
+		"",
+		"",
+		"path to a consolidated CSV file; results_mapping.csv rows from every execution are written to this file (headers are always included)")
+	rootCmd.Flags().Bool(
+		simIDMappingFileAppendArg,
+		false,
+		"when set, append to the --simid-mapping-file instead of overwriting it; headers are written only on first creation")
 	if err := rootCmd.MarkFlagRequired(userArg); err != nil {
 		panic(err)
 	}

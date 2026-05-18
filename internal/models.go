@@ -27,6 +27,10 @@ type Args struct {
 	ExcludeFile      string
 	ExcludeFiles     []string
 	CustomExtensions string
+
+	AllResultStates        bool
+	SimIDMappingFile       string
+	SimIDMappingFileAppend bool
 }
 
 type ReportJob struct {
@@ -38,6 +42,12 @@ type ReportJob struct {
 type TriagedScan struct {
 	ProjectID int
 	ScanID    int
+}
+
+type ScanSummary struct {
+	TotalProjects      int
+	ScansWithResults   int
+	ScansWithNoResults int
 }
 
 type EngineConfig struct {

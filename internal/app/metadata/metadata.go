@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -53,7 +54,7 @@ func NewMetadataFactory(
 
 //nolint:funlen,gocyclo
 func (e *Factory) GetMetadataRecord(scanID string, queries []*Query) (*Record, error) {
-	output := &Record{Queries: []*RecordQuery{}}
+	output := &Record{ScanID: scanID, Queries: []*RecordQuery{}}
 
 	for queryIdx, query := range queries {
 		output.Queries = append(output.Queries, &RecordQuery{QueryID: query.QueryID})
@@ -103,6 +104,8 @@ func (e *Factory) GetMetadataRecord(scanID string, queries []*Query) (*Record, e
 		}
 
 		// produce calculation jobs
+		var resultsMutex sync.Mutex
+		similarityCalculationResults := make([]SimilarityCalculationResult, 0, len(query.Results))
 		similarityCalculationJobs := make(chan SimilarityCalculationJob)
 		q := query
 		go func() {
@@ -111,24 +114,44 @@ func (e *Factory) GetMetadataRecord(scanID string, queries []*Query) (*Record, e
 				lastSourceFile := fileMap[result.ResultID+"|"+result.LastNode.FileName]
 				resultPath := findResultPath(result.PathID, methodLinesByPath)
 				if resultPath == nil {
-					log.Info().Msgf("Result path not found for ID: %s, on file name: %s and pathId %s",
-						result.ResultID, result.FirstNode.FileName, result.PathID)
+					log.Debug().
+						Str("resultID", result.ResultID).
+						Str("fileName", result.FirstNode.FileName).
+						Str("pathID", result.PathID).
+						Msg("result path not found; recording as similarity calculation error")
+					resultsMutex.Lock()
+					similarityCalculationResults = append(similarityCalculationResults, SimilarityCalculationResult{
+						ResultID:      result.ResultID,
+						PathID:        result.PathID,
+						DetectionDate: result.DetectionDate,
+						Err:           fmt.Errorf("result path not found for resultID %s pathID %s", result.ResultID, result.PathID),
+					})
+					resultsMutex.Unlock()
 					continue
 				}
 				methodLines := resultPath.MethodLines
 				similarityCalculationJobs <- SimilarityCalculationJob{
-					result.ResultID, result.PathID,
-					firstSourceFile.LocalName, result.FirstNode.Name, result.FirstNode.Line, result.FirstNode.Column, methodLines[0],
-					lastSourceFile.LocalName, result.LastNode.Name, result.LastNode.Line, result.LastNode.Column, methodLines[len(methodLines)-1],
-					astQueryID, e.simIDVersion,
+					ResultID:      result.ResultID,
+					PathID:        result.PathID,
+					Filename1:     firstSourceFile.LocalName,
+					Name1:         result.FirstNode.Name,
+					Line1:         result.FirstNode.Line,
+					Column1:       result.FirstNode.Column,
+					MethodLine1:   methodLines[0],
+					Filename2:     lastSourceFile.LocalName,
+					Name2:         result.LastNode.Name,
+					Line2:         result.LastNode.Line,
+					Column2:       result.LastNode.Column,
+					MethodLine2:   methodLines[len(methodLines)-1],
+					QueryID:       astQueryID,
+					SimIDVersion:  e.simIDVersion,
+					DetectionDate: result.DetectionDate,
 				}
 			}
 			close(similarityCalculationJobs)
 		}()
 
 		// consume calculation jobs
-		var resultsMutex sync.Mutex
-		similarityCalculationResults := make([]SimilarityCalculationResult, 0, len(query.Results))
 		var wg sync.WaitGroup
 		for consumerID := 1; consumerID <= worker.GetNumCPU(); consumerID++ {
 			wg.Add(1)
@@ -142,14 +165,14 @@ func (e *Factory) GetMetadataRecord(scanID string, queries []*Query) (*Record, e
 						job.QueryID,
 						job.SimIDVersion,
 					)
-					result := SimilarityCalculationResult{
-						ResultID:     job.ResultID,
-						PathID:       job.PathID,
-						SimilarityID: similarityID,
-						Err:          similarityIDErr,
-					}
 					resultsMutex.Lock()
-					similarityCalculationResults = append(similarityCalculationResults, result)
+					similarityCalculationResults = append(similarityCalculationResults, SimilarityCalculationResult{
+						ResultID:      job.ResultID,
+						PathID:        job.PathID,
+						SimilarityID:  similarityID,
+						Err:           similarityIDErr,
+						DetectionDate: job.DetectionDate,
+					})
 					resultsMutex.Unlock()
 				}
 			}()
@@ -176,7 +199,18 @@ func (e *Factory) GetMetadataRecord(scanID string, queries []*Query) (*Record, e
 		// handle calculation results
 		for _, r := range similarityCalculationResults {
 			if r.Err != nil {
-				return nil, errors.Wrap(r.Err, "failed calculating similarity id")
+				log.Debug().
+					Err(r.Err).
+					Str("scanID", scanID).
+					Str("resultID", r.ResultID).
+					Str("pathID", r.PathID).
+					Msg("skipping path: similarity ID calculation failed")
+				output.PathErrors = append(output.PathErrors, PathError{
+					ScanID: scanID,
+					PathID: r.PathID,
+					Reason: r.Err.Error(),
+				})
+				continue
 			}
 
 			recordResult, exists := recordResultByID[r.ResultID]
@@ -193,6 +227,7 @@ func (e *Factory) GetMetadataRecord(scanID string, queries []*Query) (*Record, e
 					SimilarityID:     r.SimilarityID,
 					ResultID:         r.ResultID,
 					SASTSimilarityID: origSimByKey[pathKey],
+					DetectionDate:    r.DetectionDate,
 				}
 				recordResult.Paths = append(recordResult.Paths, recordPath)
 				recordPathByKey[pathKey] = recordPath
@@ -230,7 +265,23 @@ func findResultPath(pathID string, methodLines []*interfaces.ResultPath) *interf
 }
 
 func GetQueriesFromReport(reportReader *report.CxXMLResults) []*Query {
+	return getQueriesFromReport(reportReader, false)
+}
+
+// GetAllQueriesFromReport is like GetQueriesFromReport but does not filter out results with State == "0".
+// Use this for the results_mapping.csv path when --all-result-states is set.
+func GetAllQueriesFromReport(reportReader *report.CxXMLResults) []*Query {
+	return getQueriesFromReport(reportReader, true)
+}
+
+func getQueriesFromReport(reportReader *report.CxXMLResults, allStates bool) []*Query {
+	log.Debug().
+		Str("scanID", reportReader.ScanID).
+		Bool("allStates", allStates).
+		Int("queryCount", len(reportReader.Queries)).
+		Msg("extracting queries from report")
 	var output []*Query
+	skippedResults := 0
 	for i := 0; i < len(reportReader.Queries); i++ {
 		q := reportReader.Queries[i]
 		query := &Query{
@@ -241,8 +292,13 @@ func GetQueriesFromReport(reportReader *report.CxXMLResults) []*Query {
 		}
 		for j := 0; j < len(q.Results); j++ {
 			r := q.Results[j]
-			// only triaged results will have metadata records generated
-			if r.State == "0" {
+			// only triaged results will have metadata records generated, unless allStates is set
+			if !allStates && r.State == "0" {
+				log.Debug().
+					Str("resultID", r.NodeID).
+					Str("state", r.State).
+					Msg("skipping result with state=0 (not triaged)")
+				skippedResults++
 				continue
 			}
 			for k := 0; k < len(r.Paths); k++ {
@@ -250,9 +306,10 @@ func GetQueriesFromReport(reportReader *report.CxXMLResults) []*Query {
 				firstNode := p.PathNodes[0]
 				lastNode := p.PathNodes[len(p.PathNodes)-1]
 				query.Results = append(query.Results, &Result{
-					ResultID:     p.ResultID,
-					PathID:       p.PathID,
-					SimilarityID: p.SimilarityID,
+					ResultID:      p.ResultID,
+					PathID:        p.PathID,
+					SimilarityID:  p.SimilarityID,
+					DetectionDate: r.DetectionDate,
 					FirstNode: Node{
 						FileName: firstNode.FileName,
 						Name:     firstNode.Name,
@@ -272,5 +329,12 @@ func GetQueriesFromReport(reportReader *report.CxXMLResults) []*Query {
 			output = append(output, query)
 		}
 	}
+	log.Debug().
+		Str("scanID", reportReader.ScanID).
+		Bool("allStates", allStates).
+		Int("queriesWithResults", len(output)).
+		Int("skippedResults", skippedResults).
+		Msg("finished extracting queries from report")
 	return output
 }
+

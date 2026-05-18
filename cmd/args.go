@@ -97,5 +97,17 @@ func GetArgs(cmd *cobra.Command, productName string) internal.Args {
 	if err != nil {
 		panic(err)
 	}
+	args.AllResultStates, err = cmd.Flags().GetBool(allResultStatesArg)
+	if err != nil {
+		panic(err)
+	}
+	args.SimIDMappingFile, err = cmd.Flags().GetString(simIDMappingFileArg)
+	if err != nil {
+		panic(err)
+	}
+	args.SimIDMappingFileAppend, err = cmd.Flags().GetBool(simIDMappingFileAppendArg)
+	if err != nil {
+		panic(err)
+	}
 	return args
 }

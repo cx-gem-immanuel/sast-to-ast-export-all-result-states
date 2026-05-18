@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,6 +69,7 @@ type ReportConsumeOutput struct {
 	ProjectID int
 	ScanID    int
 	Record    *metadata.Record
+	AllRecord *metadata.Record // populated only when --all-result-states is set
 }
 
 //nolint:gocyclo,funlen
@@ -387,6 +389,7 @@ func fetchTeamsData(client rest.Client, exporter export2.Exporter, args *Args) e
 func fetchProjectsData(client rest.Client, exporter export2.Exporter, resultsProjectActiveSince int,
 	teamName, projectsIDs string, isDefaultProjectActiveSince bool) ([]*rest.Project, error) {
 	log.Info().Msg("collecting projects")
+	log.Info().Msg("searching for projects...")
 	projects := []*rest.Project{}
 	projectOffset := 0
 	projectLimit := resultsPageLimit
@@ -397,7 +400,6 @@ func fetchProjectsData(client rest.Client, exporter export2.Exporter, resultsPro
 			Int("offset", projectOffset).
 			Int("limit", projectLimit).
 			Msg("fetching projects with custom fields")
-		log.Info().Msg("searching for projects...")
 
 		projectsItems, projectsErr := client.GetProjects(fromDate, teamName, projectsIDs, projectOffset, projectLimit)
 		if projectsErr != nil {
@@ -559,7 +561,7 @@ func fetchResultsData(client rest.Client, astQueryProvider interfaces.ASTQueryPr
 	}
 
 	fromDate := getDateFrom(resultsProjectActiveSince, args.IsDefaultProjectActiveSince, projectsIDs)
-	triagedScans, triagedScanErr := getTriagedScans(client, fromDate, teamName, projectsIDs)
+	triagedScans, scanSummary, triagedScanErr := getTriagedScans(client, fromDate, teamName, projectsIDs, args.AllResultStates)
 	if triagedScanErr != nil {
 		return triagedScanErr
 	}
@@ -672,41 +674,115 @@ func fetchResultsData(client rest.Client, astQueryProvider interfaces.ASTQueryPr
 				}
 			}
 
-			metadataQueries := metadata.GetQueriesFromReport(&reportReader)
-			metadataRecord, metadataRecordErr := metadataProvider.GetMetadataRecord(reportReader.ScanID, metadataQueries)
-			if metadataRecordErr != nil {
-				l.Debug().Err(metadataRecordErr).Msg("failed creating metadata")
-				reportConsumeOutputs <- ReportConsumeOutput{Err: metadataRecordErr, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID}
-				continue
+			var metadataRecord *metadata.Record
+			var metadataRecordErr error
+			if args.AllResultStates {
+				// Skip triaged-only metadata calculation — allMetadataRecord covers the full set
+				// and will be used for both JSON and results_mapping.csv.
+				metadataRecord = &metadata.Record{ProjectID: reportJob.ProjectID, ScanID: reportReader.ScanID}
+			} else {
+				metadataQueries := metadata.GetQueriesFromReport(&reportReader)
+				metadataRecord, metadataRecordErr = metadataProvider.GetMetadataRecord(reportReader.ScanID, metadataQueries)
+				if metadataRecordErr != nil {
+					l.Debug().Err(metadataRecordErr).Msg("failed creating metadata")
+					reportConsumeOutputs <- ReportConsumeOutput{Err: metadataRecordErr, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID}
+					continue
+				}
+				metadataRecord.ProjectID = reportJob.ProjectID
+				for i := range metadataRecord.PathErrors {
+					metadataRecord.PathErrors[i].ProjectID = reportJob.ProjectID
+				}
 			}
-			metadataRecordJSON, metadataRecordJSONErr := json.Marshal(metadataRecord)
+
+			// When --all-result-states is set, also compute metadata from all result states
+			// (bypassing the State=="0" filter) to be used exclusively for results_mapping.csv.
+			var allMetadataRecord *metadata.Record
+			if args.AllResultStates {
+				l.Debug().
+					Int("projectID", reportJob.ProjectID).
+					Int("scanID", reportJob.ScanID).
+					Msg("--all-result-states: extracting queries for all states (including state=0)")
+				allQueries := metadata.GetAllQueriesFromReport(&reportReader)
+				l.Debug().
+					Int("projectID", reportJob.ProjectID).
+					Int("scanID", reportJob.ScanID).
+					Int("queryCount", len(allQueries)).
+					Msg("--all-result-states: computing metadata record for all states")
+				allMetadataRecord, metadataRecordErr = metadataProvider.GetMetadataRecord(reportReader.ScanID, allQueries)
+				if metadataRecordErr != nil {
+					l.Warn().Err(metadataRecordErr).
+						Int("projectID", reportJob.ProjectID).
+						Int("scanID", reportJob.ScanID).
+						Msg("--all-result-states: failed creating all-states metadata record; falling back to triaged record for JSON")
+					allMetadataRecord = metadataRecord
+				} else {
+					allMetadataRecord.ProjectID = reportJob.ProjectID
+					for i := range allMetadataRecord.PathErrors {
+						allMetadataRecord.PathErrors[i].ProjectID = reportJob.ProjectID
+					}
+					l.Debug().
+						Int("projectID", reportJob.ProjectID).
+						Int("scanID", reportJob.ScanID).
+						Msg("--all-result-states: all-states metadata record created successfully")
+				}
+			}
+
+			// When --all-result-states is set, use the all-states record for the JSON
+			// so that scans with only untriaged results still get a populated metadata file.
+			metadataRecordForJSON := metadataRecord
+			if args.AllResultStates && allMetadataRecord != nil {
+				metadataRecordForJSON = allMetadataRecord
+			}
+			metadataRecordJSON, metadataRecordJSONErr := json.Marshal(metadataRecordForJSON)
 			if metadataRecordJSONErr != nil {
-				l.Debug().Err(metadataRecordJSONErr).Msg("failed marshaling metadata")
-				reportConsumeOutputs <- ReportConsumeOutput{Err: metadataRecordJSONErr, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID}
-				continue
+				if !args.AllResultStates {
+					l.Debug().Err(metadataRecordJSONErr).Msg("failed marshaling metadata")
+					reportConsumeOutputs <- ReportConsumeOutput{Err: metadataRecordJSONErr, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID}
+					continue
+				}
+				l.Warn().Err(metadataRecordJSONErr).
+					Int("projectID", reportJob.ProjectID).
+					Int("scanID", reportJob.ScanID).
+					Msg("--all-result-states: failed marshaling metadata; skipping JSON file but continuing to XML")
 			}
-			exportMetadataErr := exporter.AddFile(fmt.Sprintf(scansMetadataFileName, reportJob.ProjectID), metadataRecordJSON)
-			if exportMetadataErr != nil {
-				l.Debug().Err(exportMetadataErr).Msg("failed saving metadata")
-				reportConsumeOutputs <- ReportConsumeOutput{Err: exportMetadataErr, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID}
-				continue
+			if metadataRecordJSON != nil {
+				exportMetadataErr := exporter.AddFile(fmt.Sprintf(scansMetadataFileName, reportJob.ProjectID), metadataRecordJSON)
+				if exportMetadataErr != nil {
+					if !args.AllResultStates {
+						l.Debug().Err(exportMetadataErr).Msg("failed saving metadata")
+						reportConsumeOutputs <- ReportConsumeOutput{Err: exportMetadataErr, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID}
+						continue
+					}
+					l.Warn().Err(exportMetadataErr).
+						Int("projectID", reportJob.ProjectID).
+						Int("scanID", reportJob.ScanID).
+						Msg("--all-result-states: failed saving metadata JSON; continuing to XML")
+				}
 			}
 
 			transformedReportData, transformErr := export2.TransformScanReport(
 				dataToTransform, export2.TransformOptions{NestedTeams: args.NestedTeams},
 			)
 			if transformErr != nil {
-				l.Debug().Err(transformErr).Msg("failed transforming report data")
-				reportConsumeOutputs <- ReportConsumeOutput{Err: transformErr, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID}
-				continue
+				if !args.AllResultStates {
+					l.Debug().Err(transformErr).Msg("failed transforming report data")
+					reportConsumeOutputs <- ReportConsumeOutput{Err: transformErr, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID}
+					continue
+				}
+				l.Warn().Err(transformErr).
+					Int("projectID", reportJob.ProjectID).
+					Int("scanID", reportJob.ScanID).
+					Msg("--all-result-states: failed transforming report data; writing raw report data instead")
+				transformedReportData = dataToTransform
 			}
+
 			exportErr := exporter.AddFile(fmt.Sprintf(scansFileName, reportJob.ProjectID), transformedReportData)
 			if exportErr != nil {
 				l.Debug().Err(exportErr).Msg("failed saving result")
 				reportConsumeOutputs <- ReportConsumeOutput{Err: exportErr, ProjectID: reportJob.ProjectID,
-					ScanID: reportJob.ScanID, Record: metadataRecord}
+					ScanID: reportJob.ScanID, Record: metadataRecord, AllRecord: allMetadataRecord}
 			} else {
-				reportConsumeOutputs <- ReportConsumeOutput{Err: nil, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID, Record: metadataRecord}
+				reportConsumeOutputs <- ReportConsumeOutput{Err: nil, ProjectID: reportJob.ProjectID, ScanID: reportJob.ScanID, Record: metadataRecord, AllRecord: allMetadataRecord}
 			}
 		}
 	} // End of consumeReportForWorker closure
@@ -716,19 +792,68 @@ func fetchResultsData(client rest.Client, astQueryProvider interfaces.ASTQueryPr
 	}
 
 	metadataRecord := make([]*metadata.Record, 0)
+	allMetadataRecord := make([]*metadata.Record, 0)
 	reportConsumeErrorCount := 0
+
+	// Open the simid mapping writer once before the loop so records are streamed
+	// to disk as soon as they are available rather than buffered in memory.
+	var simWriter *simIDMappingWriter
+	if args.SimIDMappingFile != "" {
+		var openErr error
+		simWriter, openErr = openSimIDMappingWriter(args.SimIDMappingFile, args.SimIDMappingFileAppend)
+		if openErr != nil {
+			log.Warn().Err(openErr).Str("file", args.SimIDMappingFile).Msg("failed opening simid mapping writer; simid mapping will not be written")
+		} else {
+			defer simWriter.close()
+		}
+	}
+
 	for i := 0; i < reportCount; i++ {
 		consumeOutput := <-reportConsumeOutputs
 		if consumeOutput.Record != nil {
 			metadataRecord = append(metadataRecord, consumeOutput.Record)
 		}
+
+		// Choose the right record for the simid mapping file.
+		var simRecord *metadata.Record
+		if args.AllResultStates && consumeOutput.AllRecord != nil {
+			log.Debug().
+				Int("projectID", consumeOutput.ProjectID).
+				Int("scanID", consumeOutput.ScanID).
+				Msg("--all-result-states: collected all-states metadata record")
+			allMetadataRecord = append(allMetadataRecord, consumeOutput.AllRecord)
+			simRecord = consumeOutput.AllRecord
+		} else if !args.AllResultStates && consumeOutput.Record != nil {
+			simRecord = consumeOutput.Record
+		}
+
+		// Stream this record to the simid mapping file immediately.
+		if simWriter != nil && simRecord != nil {
+			log.Debug().
+				Int("projectID", simRecord.ProjectID).
+				Str("scanID", simRecord.ScanID).
+				Msg("streaming record to simid mapping file")
+			if writeErr := simWriter.writeRecord(simRecord); writeErr != nil {
+				log.Warn().Err(writeErr).
+					Int("projectID", simRecord.ProjectID).
+					Str("scanID", simRecord.ScanID).
+					Msg("failed streaming record to simid mapping file")
+			}
+			if writeErr := simWriter.writePathErrors(simRecord); writeErr != nil {
+				log.Warn().Err(writeErr).
+					Int("projectID", simRecord.ProjectID).
+					Str("scanID", simRecord.ScanID).
+					Msg("failed streaming path errors to similarity mapping error log")
+			}
+		}
+
 		reportIndex := i + 1
 		if consumeOutput.Err == nil {
 			log.Info().
 				Int("projectID", consumeOutput.ProjectID).
 				Int("scanID", consumeOutput.ScanID).
 				Str("progress", fmt.Sprintf("%d/%d", reportIndex, reportCount)).
-				Msg("Successfully collected results")
+				Msg("Fetched results XML")
 		} else {
 			reportConsumeErrorCount++
 			log.Warn().
@@ -739,7 +864,20 @@ func fetchResultsData(client rest.Client, astQueryProvider interfaces.ASTQueryPr
 		}
 	}
 
-	allResultsMappingErr := addAllResultsMappingToFile(metadataRecord, exporter)
+	// Choose which metadata to use for the internal results_mapping.csv (zip export).
+	resultsMappingSource := metadataRecord
+	if args.AllResultStates {
+		log.Debug().
+			Int("allStatesRecordCount", len(allMetadataRecord)).
+			Msg("--all-result-states: using all-states metadata as source for results_mapping.csv")
+		resultsMappingSource = allMetadataRecord
+	} else {
+		log.Debug().
+			Int("recordCount", len(metadataRecord)).
+			Msg("using triaged-only metadata as source for results_mapping.csv")
+	}
+
+	allResultsMappingErr := addAllResultsMappingToFile(resultsMappingSource, exporter)
 	if allResultsMappingErr != nil {
 		log.Debug().Err(allResultsMappingErr).Msg("failed saving results mapping")
 	}
@@ -747,6 +885,13 @@ func fetchResultsData(client rest.Client, astQueryProvider interfaces.ASTQueryPr
 	if reportConsumeErrorCount > 0 {
 		log.Warn().Msgf("failed collecting %d/%d results", reportConsumeErrorCount, reportCount)
 	}
+
+	log.Info().
+		Int("totalProjects", scanSummary.TotalProjects).
+		Int("projectsWithScans", scanSummary.ScansWithResults).
+		Int("scansWithResults", scanSummary.ScansWithResults).
+		Int("scansWithNoResults", scanSummary.ScansWithNoResults).
+		Msg("scan results summary")
 
 	return nil
 }
@@ -828,8 +973,208 @@ func addAllResultsMappingToFile(metadataRecord []*metadata.Record, exporter expo
 	return nil
 }
 
-func getTriagedScans(client rest.Client, fromDate, teamName, projectsIDs string) ([]TriagedScan, error) {
+// simIDMappingWriter holds open file handles for the similarity mapping CSV and its
+// companion error log. Both files are opened once and streamed to as records arrive.
+type simIDMappingWriter struct {
+	csvPath string
+	logPath string
+	csvFile *os.File
+	logFile *os.File
+}
+
+// openSimIDMappingWriter opens (or creates) the CSV and error log files.
+// In overwrite mode both files are truncated; in append mode they are opened for appending
+// and the CSV header is omitted when the file already has content.
+// If either file is locked by another process, a timestamped fallback name is used.
+func openSimIDMappingWriter(filePath string, appendMode bool) (*simIDMappingWriter, error) {
+	w := &simIDMappingWriter{
+		csvPath: filePath,
+		logPath: filepath.Join(filepath.Dir(filePath), "similarity_mapping_error.log"),
+	}
+
+	var csvFlags int
+	writeHeader := true
+	if appendMode {
+		csvFlags = os.O_APPEND | os.O_CREATE | os.O_WRONLY
+		if fi, err := os.Stat(filePath); err == nil && fi.Size() > 0 {
+			log.Debug().Str("file", filePath).Msg("append mode: file exists; skipping header row")
+			writeHeader = false
+		} else {
+			log.Debug().Str("file", filePath).Msg("append mode: file is new; writing header row")
+		}
+	} else {
+		csvFlags = os.O_TRUNC | os.O_CREATE | os.O_WRONLY
+		log.Debug().Str("file", filePath).Msg("overwrite mode: truncating file and writing header row")
+	}
+
+	csvFile, csvErr := openWithFallback(filePath, csvFlags)
+	if csvErr != nil {
+		return nil, csvErr
+	}
+	w.csvFile = csvFile
+	w.csvPath = csvFile.Name() // may differ from filePath if fallback was used
+
+	if writeHeader {
+		header := resultsmapping.GenerateCSVWithDetectionDate(nil) // returns header-only slice
+		if _, err := csvFile.Write(resultsmapping.WriteAllToCsv(header)); err != nil {
+			_ = csvFile.Close()
+			return nil, fmt.Errorf("failed writing simid mapping CSV header: %w", err)
+		}
+	}
+
+	var logFlags int
+	if appendMode {
+		logFlags = os.O_APPEND | os.O_CREATE | os.O_WRONLY
+	} else {
+		logFlags = os.O_TRUNC | os.O_CREATE | os.O_WRONLY
+	}
+	logFile, logErr := openWithFallback(w.logPath, logFlags)
+	if logErr != nil {
+		_ = csvFile.Close()
+		return nil, logErr
+	}
+	w.logFile = logFile
+	w.logPath = logFile.Name() // may differ if fallback was used
+
+	log.Debug().
+		Str("csvFile", w.csvPath).
+		Str("logFile", w.logPath).
+		Bool("appendMode", appendMode).
+		Msg("opened simid mapping writer")
+	return w, nil
+}
+
+// openWithFallback tries to open filePath with the given flags. If the open fails because
+// the file is locked/in-use, it retries up to two more times with timestamp-suffixed fallback
+// names. If all three attempts fail, it logs a fatal error and exits.
+func openWithFallback(filePath string, flags int) (*os.File, error) {
+	const maxAttempts = 3
+	ext := filepath.Ext(filePath)
+	base := strings.TrimSuffix(filePath, ext)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		candidate := filePath
+		if attempt > 1 {
+			candidate = fmt.Sprintf("%s_%s%s", base, time.Now().UTC().Format("20060102T150405Z"), ext)
+			log.Warn().
+				Str("file", filePath).
+				Str("fallback", candidate).
+				Int("attempt", attempt).
+				Msg("file appears locked by another process; retrying with fallback file")
+		}
+
+		f, err := os.OpenFile(candidate, flags, 0o644)
+		if err == nil {
+			if attempt > 1 {
+				log.Warn().
+					Str("original", filePath).
+					Str("fallback", candidate).
+					Msg("successfully opened fallback file")
+			}
+			return f, nil
+		}
+
+		if !isFileLocked(err) {
+			log.Debug().Err(err).Str("file", candidate).Msg("failed opening file (non-lock error)")
+			return nil, err
+		}
+
+		log.Warn().
+			Err(err).
+			Str("file", candidate).
+			Int("attempt", attempt).
+			Int("maxAttempts", maxAttempts).
+			Msg("file is locked")
+	}
+
+	log.Fatal().
+		Str("file", filePath).
+		Int("maxAttempts", maxAttempts).
+		Msg("could not open file or any fallback after maximum attempts; exiting")
+	return nil, fmt.Errorf("could not open %s after %d attempts", filePath, maxAttempts)
+}
+
+
+// isFileLocked returns true when the OS error indicates the file is locked by another process.
+func isFileLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	// syscall.ERROR_SHARING_VIOLATION (0x20) on Windows; EAGAIN/EACCES on Unix.
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "sharing violation") ||
+		strings.Contains(errStr, "used by another process") ||
+		strings.Contains(errStr, "eagain") ||
+		strings.Contains(errStr, "locked")
+}
+
+// writeRecord streams a single record's CSV rows to the open CSV file.
+func (w *simIDMappingWriter) writeRecord(record *metadata.Record) error {
+	rows := resultsmapping.GenerateCSVWithDetectionDateForRecord(record)
+	if len(rows) == 0 {
+		log.Debug().
+			Int("projectID", record.ProjectID).
+			Str("scanID", record.ScanID).
+			Msg("no rows to stream for record")
+		return nil
+	}
+	log.Debug().
+		Int("projectID", record.ProjectID).
+		Str("scanID", record.ScanID).
+		Int("rowCount", len(rows)).
+		Msg("streaming CSV rows for record")
+	_, err := w.csvFile.Write(resultsmapping.WriteAllToCsv(rows))
+	return err
+}
+
+// writePathErrors streams any path errors for a single record to the open error log file.
+func (w *simIDMappingWriter) writePathErrors(record *metadata.Record) error {
+	if len(record.PathErrors) == 0 {
+		return nil
+	}
+	for _, pe := range record.PathErrors {
+		line := fmt.Sprintf("timestamp=%s project_id=%d scan_id=%s path_id=%s reason=%s\n",
+			time.Now().UTC().Format(time.RFC3339), pe.ProjectID, pe.ScanID, pe.PathID, pe.Reason)
+		log.Debug().
+			Int("projectID", pe.ProjectID).
+			Str("scanID", pe.ScanID).
+			Str("pathID", pe.PathID).
+			Str("reason", pe.Reason).
+			Msg("streaming similarity calculation error to log")
+		if _, err := w.logFile.WriteString(line); err != nil {
+			log.Debug().Err(err).Str("logFile", w.logPath).Msg("failed writing error line")
+			return err
+		}
+	}
+	log.Debug().
+		Int("projectID", record.ProjectID).
+		Str("scanID", record.ScanID).
+		Int("errorCount", len(record.PathErrors)).
+		Msg("streamed path errors to similarity mapping error log")
+	return nil
+}
+
+// close flushes and closes both the CSV and error log files.
+func (w *simIDMappingWriter) close() {
+	if w.csvFile != nil {
+		if err := w.csvFile.Close(); err != nil {
+			log.Debug().Err(err).Str("file", w.csvPath).Msg("failed closing simid mapping CSV file")
+		} else {
+			log.Info().Str("file", w.csvPath).Msg("closed simid mapping CSV file")
+		}
+	}
+	if w.logFile != nil {
+		if err := w.logFile.Close(); err != nil {
+			log.Debug().Err(err).Str("file", w.logPath).Msg("failed closing similarity mapping error log")
+		} else {
+			log.Debug().Str("file", w.logPath).Msg("closed similarity mapping error log")
+		}
+	}
+}
+
+func getTriagedScans(client rest.Client, fromDate, teamName, projectsIDs string, allResultStates bool) ([]TriagedScan, ScanSummary, error) {
 	var output []TriagedScan
+	var summary ScanSummary
 	projectOffset := 0
 	projectLimit := resultsPageLimit
 
@@ -846,7 +1191,7 @@ func getTriagedScans(client rest.Client, fromDate, teamName, projectsIDs string)
 			projectLimit)
 		if fetchErr != nil {
 			log.Debug().Err(fetchErr).Msg("failed fetching project last scans")
-			return output, fmt.Errorf("error searching for results")
+			return output, summary, fmt.Errorf("error searching for results")
 		}
 		if len(*projects) == 0 {
 			// all pages fetched
@@ -858,25 +1203,51 @@ func getTriagedScans(client rest.Client, fromDate, teamName, projectsIDs string)
 			Msg("processing project last scans")
 
 		for _, project := range *projects {
-			// get triaged results
-			triagedResults, triagedResultsErr := client.GetTriagedResultsByScanID(project.LastScanID)
-			if triagedResultsErr != nil {
-				log.Debug().Err(triagedResultsErr).
+			summary.TotalProjects++
+			var (
+				results    *[]rest.TriagedScanResult
+				resultsErr error
+			)
+			// When --all-result-states is set, bypass the "Comment ne null" OData filter
+			// so that scans with any results (not only commented/triaged ones) are included
+			// in the results_mapping.csv path.
+			if allResultStates {
+				log.Debug().
+					Int("projectID", project.ID).
+					Int("scanID", project.LastScanID).
+					Msg("--all-result-states: querying scan results without OData comment filter")
+				results, resultsErr = client.GetAllResultsByScanID(project.LastScanID)
+			} else {
+				log.Debug().
+					Int("projectID", project.ID).
+					Int("scanID", project.LastScanID).
+					Msg("querying scan results with OData comment filter")
+				results, resultsErr = client.GetTriagedResultsByScanID(project.LastScanID)
+			}
+			if resultsErr != nil {
+				log.Debug().Err(resultsErr).
 					Int("projectID", project.ID).
 					Int("scanID", project.LastScanID).
 					Msg("failed fetching triaged results")
-				return output, triagedResultsErr
+				return output, summary, resultsErr
 			}
-			if len(*triagedResults) > 0 {
+			if len(*results) > 0 {
 				output = append(output, TriagedScan{project.ID, project.LastScanID})
-				log.Info().Msgf("%d triaged results found from projectId=%d scanId=%d", len(*triagedResults), project.ID, project.LastScanID)
+				summary.ScansWithResults++
+				log.Info().Msgf("Found scan results in projectId=%d scanId=%d", project.ID, project.LastScanID)
+			} else {
+				summary.ScansWithNoResults++
+				log.Info().
+					Int("projectID", project.ID).
+					Int("scanID", project.LastScanID).
+					Msg("No scan results in")
 			}
 		}
 
 		// prepare to fetch next page
 		projectOffset += projectLimit
 	}
-	return output, nil
+	return output, summary, nil
 }
 
 func getProjectConfigurations(client rest.Client, projects []*rest.Project, exporter export2.Exporter, projectIDs string) error {
