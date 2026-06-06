@@ -714,7 +714,25 @@ func fetchResultsData(client rest.Client, astQueryProvider interfaces.ASTQueryPr
 						Int("projectID", reportJob.ProjectID).
 						Int("scanID", reportJob.ScanID).
 						Msg("--all-result-states: failed creating all-states metadata record; falling back to triaged record for JSON")
-					allMetadataRecord = metadataRecord
+					// Record a PathError for every path so the failure is visible in similarity_mapping_error.log
+					allMetadataRecord = &metadata.Record{ProjectID: reportJob.ProjectID, ScanID: reportReader.ScanID}
+					for _, q := range allQueries {
+						for _, r := range q.Results {
+							allMetadataRecord.PathErrors = append(allMetadataRecord.PathErrors, metadata.PathError{
+								ProjectID: reportJob.ProjectID,
+								ScanID:    reportReader.ScanID,
+								PathID:    r.PathID,
+								Reason:    metadataRecordErr.Error(),
+							})
+						}
+					}
+					// Use triaged queries as JSON fallback since allMetadataRecord has no similarity data
+					allMetadataRecord.Queries = metadataRecord.Queries
+					l.Debug().
+						Int("projectID", reportJob.ProjectID).
+						Int("scanID", reportJob.ScanID).
+						Int("pathErrorCount", len(allMetadataRecord.PathErrors)).
+						Msg("--all-result-states: recorded path errors for all paths due to metadata record failure")
 				} else {
 					allMetadataRecord.ProjectID = reportJob.ProjectID
 					for i := range allMetadataRecord.PathErrors {

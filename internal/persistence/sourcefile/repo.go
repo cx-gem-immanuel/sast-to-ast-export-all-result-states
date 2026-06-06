@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/checkmarxDev/ast-sast-export/internal/app/interfaces"
 	"github.com/rs/zerolog/log"
@@ -96,5 +97,39 @@ func createFileAndPath(filename string, content []byte, filePerm, dirPerm os.Fil
 	if pathErr != nil {
 		return pathErr
 	}
-	return os.WriteFile(filename, content, filePerm)
+	const maxAttempts = 5
+	const retryDelay = 200 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		lastErr = os.WriteFile(filename, content, filePerm)
+		if lastErr == nil {
+			return nil
+		}
+		if !isFileLockedError(lastErr) {
+			return lastErr
+		}
+		if attempt < maxAttempts {
+			log.Warn().
+				Err(lastErr).
+				Str("file", filename).
+				Int("attempt", attempt).
+				Int("maxAttempts", maxAttempts).
+				Msgf("file appears locked; retrying in %s", retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
+	return errors.Wrapf(lastErr, "file locked after %d attempts", maxAttempts)
+}
+
+// isFileLockedError returns true when the OS error indicates the file is locked by another process.
+func isFileLockedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "sharing violation") ||
+		strings.Contains(errStr, "used by another process") ||
+		strings.Contains(errStr, "user-mapped section") ||
+		strings.Contains(errStr, "eagain") ||
+		strings.Contains(errStr, "locked")
 }
